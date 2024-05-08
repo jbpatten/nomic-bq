@@ -2,9 +2,7 @@ import unittest
 from unittest.mock import patch
 import pandas as pd
 
-from atlas import map_data
-
-# ... your map_data function
+from nomic.atlas import map_data
 
 class TestMapData(unittest.TestCase):
 
