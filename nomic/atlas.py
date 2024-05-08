@@ -12,6 +12,7 @@ from loguru import logger
 from pandas import DataFrame
 from pyarrow import Table
 from tqdm import tqdm
+from google.cloud import bigquery
 
 from .data_inference import NomicDuplicatesOptions, NomicEmbedOptions, NomicProjectOptions, NomicTopicOptions
 from .dataset import AtlasDataset, AtlasDataStream
@@ -20,8 +21,9 @@ from .utils import arrow_iterator, b64int, get_random_name
 
 
 def map_data(
-    data: Optional[Union[DataFrame, List[Dict], Table]] = None,
+    data: Optional[Union[DataFrame, List[Dict], Table, bigquery.client.QueryJob]] = None,
     embeddings: Optional[np.ndarray] = None,
+    embeddings_column: Optional[str] = None,
     identifier: Optional[str] = None,
     description: str = "",
     id_field: Optional[str] = None,
@@ -35,7 +37,7 @@ def map_data(
     """
 
     Args:
-        data: An ordered collection of the datapoints you are structuring. Can be a list of dictionaries, Pandas Dataframe or PyArrow Table.
+        data: An ordered collection of the datapoints you are structuring. Can be a list of dictionaries, Pandas Dataframe, PyArrow Table or BigQuery QueryJob.
         embeddings: An [N,d] numpy array containing the N embeddings to add.
         identifier: A name for your dataset that is used to generate the dataset identifier. A unique name will be chosen if not supplied.
         description: The description of your dataset
@@ -48,7 +50,34 @@ def map_data(
     :return:
     """
     modality = "embedding"
-    if embeddings is not None:
+    if embeddings_column:
+        # Embedding column provided, assume data is a BigQuery QueryJob
+        if not isinstance(data, bigquery.client.QueryJob):
+            raise ValueError("embeddings_column argument requires data to be a BigQuery QueryJob")
+
+        # Execute BigQuery query, get results, and convert to DataFrame
+        data = (
+            bigquery.Client()
+            .query(data)
+            .result()
+            .to_dataframe()
+            # Handle array<numeric> columns and cast to potential embeddings
+            .apply(
+                lambda col: np.fromstring(col, sep=",", dtype=float) if col.dtype == np.object_ else col,
+                axis=0,
+                ignore_index=True,
+            )
+        )
+
+        # Check if the specified embeddings_column exists
+        if embeddings_column not in data.columns:
+            raise ValueError(f"Column '{embeddings_column}' not found in the BigQuery data.")
+
+        # Extract embeddings from the specified column
+        embeddings = data[embeddings_column].to_numpy()
+        data = data.drop(embeddings_column, axis=1)  # Remove embedding column from data
+
+    elif embeddings is not None:
         assert isinstance(embeddings, np.ndarray), "You must pass in a numpy array"
         if embeddings.size == 0:
             raise Exception("Your embeddings cannot be empty")
@@ -84,6 +113,10 @@ def map_data(
                 # do not modify object the user passed in - also ensures IDs are unique if two input datums are the same *object*
                 data[i] = data[i].copy()
                 data[i][id_field] = b64int(i)
+        elif isinstance(data, bigquery.client.QueryJob):
+        # Execute BigQuery query, get results, and convert to DataFrame
+            data = (bigquery.Client().query(data).result().to_dataframe()            
+                    .apply(lambda col: np.fromstring(col, sep=",", dtype=float) if col.dtype == np.object_ else col, axis=0, ignore_index=True))
         elif isinstance(data, DataFrame) and id_field not in data.columns:
             data[id_field] = [b64int(i) for i in range(data.shape[0])]
             added_id_field = True
@@ -92,7 +125,7 @@ def map_data(
             data = data.append_column(id_field, ids)  # type: ignore
             added_id_field = True
         elif id_field not in data[0]:
-            raise ValueError("map_data data must be a list of dicts, a pandas dataframe, or a pyarrow table")
+            raise ValueError("map_data data must be a list of dicts, a pandas dataframe, pyarrow table, or BigQuery QueryJob")
 
     if added_id_field:
         logger.warning("An ID field was not specified in your data so one was generated for you in insertion order.")
